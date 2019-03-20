@@ -1,0 +1,138 @@
+## Frontend deployed at http://frontend.a2726e793b2f48dc858a.eastus.aksapp.io/
+
+# Kubernetes the hard way
+https://github.com/kelseyhightower/kubernetes-the-hard-way
+
+# Run these in the cloud terminal, login at portal.azure.com
+# Get kubernetes latest version
+region=eastus
+az aks get-versions -l $region -o table
+kubernetesVersionLatest=$(az aks get-versions -l ${region} --query 'orchestrators[-1].orchestratorVersion' -o tsv)
+
+# Create resource group
+az group create --name akschallenge --location $region
+
+# Create AKS using the latest version and enable the monitoring addon
+uniqueaksclustername=lcg-aks-cluster
+az aks create --resource-group akschallenge --name $uniqueaksclustername --enable-addons monitoring --kubernetes-version $kubernetesVersionLatest --generate-ssh-keys --location $region
+
+az aks get-credentials --resource-group akschallenge --name $uniqueaksclustername
+
+# Deploy MongoDB to cluster
+wget https://aksworkshop.io/yaml-solutions/01.%20challenge-02/helm-rbac.yaml
+kubectl apply -f helm-rbac.yaml
+helm init --service-account tiller
+
+# Install mongodb helm chart
+helm install stable/mongodb --name orders-mongo --set mongodbUsername=orders-user,mongodbPassword=orders-password,mongodbDatabase=akschallenge
+
+###### MONGODB OUTPUT #######
+##MongoDB can be accessed via port 27017 on the following DNS name from within your cluster:
+##
+##    orders-mongo-mongodb.default.svc.cluster.local
+
+##To get the root password run:
+##
+##    export MONGODB_ROOT_PASSWORD=$(kubectl get secret --namespace default orders-mongo-mongodb -o jsonpath="{.data.mongodb-root-password}" | base64 --decode)
+
+##To get the password for "orders-user" run:
+##
+##    export MONGODB_PASSWORD=$(kubectl get secret --namespace default orders-mongo-mongodb -o jsonpath="{.data.mongodb-password}" | base64 --decode)
+
+##To connect to your database run the following command:
+##
+##    kubectl run --namespace default orders-mongo-mongodb-client --rm --tty -i --restart='Never' --image bitnami/mongodb --command -- mongo admin--host orders-mongo-mongodb --authenticationDatabase admin -u root -p $MONGODB_ROOT_PASSWORD
+
+##To connect to your database from outside the cluster execute the following commands:
+##
+##    kubectl port-forward --namespace default svc/orders-mongo-mongodb 27017:27017 &
+##    mongo --host 127.0.0.1 --authenticationDatabase admin -p $MONGODB_ROOT_PASSWORD
+
+#############################
+
+# Set env variables
+TEAMNAME=lcg
+MONGOHOST=orders-mongo-mongodb.default.svc.cluster.local
+MONGOUSER=orders-user
+MONGOPASSWORD=orders-password
+
+wget https://aksworkshop.io/yaml-solutions/01.%20challenge-02/captureorder-deployment.yaml
+kubectl apply -f captureorder-deployment.yaml
+kubectl get pods -l app=captureorder
+
+wget https://aksworkshop.io/yaml-solutions/01.%20challenge-02/captureorder-service.yaml
+kubectl apply -f captureorder-service.yaml
+# Retrieve external IP of service
+kubectl get service captureorder -o jsonpath="{.status.loadBalancer.ingress[*].ip}"
+# 13.92.180.78
+
+curl -d '{"EmailAddress": "email@domain.com", "Product": "prod-1", "Total": 100}' -H "Content-Type: application/json" -X POST http://13.92.180.78/v1/order
+
+# Deploy frontend using Ingress
+CAPTUREORDERSERVICEIP=13.92.180.78
+
+wget https://aksworkshop.io/yaml-solutions/01.%20challenge-02/frontend-deployment.yaml
+sed -i 's/_PUBLIC_IP_CAPTUREORDERSERVICE_/13.92.180.78/g' frontend-deployment.yaml
+kubectl apply -f frontend-deployment.yaml
+kubectl get pods -l app=frontend
+
+# Expose frontend on a hostname
+
+# Enable http routing on cluster
+az aks enable-addons --resource-group akschallenge --name $uniqueaksclustername --addons http_application_routing
+
+# Frontend Service
+wget https://aksworkshop.io/yaml-solutions/01.%20challenge-02/frontend-service.yaml
+kubectl apply -f frontend-service.yaml
+az aks show --resource-group akschallenge --name $uniqueaksclustername --query addonProfiles.httpApplicationRouting.config.HTTPApplicationRoutingZoneName -o table
+# Result a2726e793b2f48dc858a.eastus.aksapp.io
+
+# Frontend ingress
+wget https://aksworkshop.io/yaml-solutions/01.%20challenge-02/frontend-ingress.yaml
+sed -i 's/_CLUSTER_SPECIFIC_DNS_ZONE_/a2726e793b2f48dc858a.eastus.aksapp.io/g' frontend-ingress.yaml
+kubectl apply -f frontend-ingress.yaml
+
+# Verify dns records
+http://frontend.a2726e793b2f48dc858a.eastus.aksapp.io/
+
+# 2.5 Monitoring
+az aks enable-addons --resource-group akschallenge --name $uniqueaksclustername --addons monitoring
+
+# Live container logs
+wget https://aksworkshop.io/yaml-solutions/01.%20challenge-03/logreader-rbac.yaml
+kubectl apply -f logreader-rbac.yaml
+
+# 2.6 Scaling
+CAPTUREORDERSERVICEIP=13.92.180.78
+az container create -g akschallenge -n loadtest --image azch/loadtest --restart-policy Never -e SERVICE_IP=$CAPTUREORDERSERVICEIP
+# View logs
+az container logs -g akschallenge -n loadtest
+# Delete logs
+az container delete -g akschallenge -n loadtest
+
+# Horizontal pod autoscaler
+wget https://aksworkshop.io/yaml-solutions/01.%20challenge-04/captureorder-hpa.yaml
+# REMOVE line replicas in captureorder-deployment.yaml before doing the next
+kubectl apply -f captureorder-hpa.yaml
+
+# Run load test again
+az container create -g akschallenge -n loadtest --image azch/loadtest --restart-policy Never -e SERVICE_IP=$CAPTUREORDERSERVICEIP
+az aks scale --resource-group akschallenge --name $uniqueaksclustername --node-count 4
+
+# 2.7
+az acr create --resource-group akschallenge --name lcgacr --sku Standard --location $region
+az acr login --name lcgacr
+# Replace Dockerfile /utils with /azure
+az acr build -t "captureorder:{{.Run.ID}}" -r lcgacr .
+
+
+AKS_RESOURCE_GROUP=akschallenge
+AKS_CLUSTER_NAME=lcg-aks-cluster
+ACR_RESOURCE_GROUP=akschallenge
+ACR_NAME=lcgacr
+# Get the id of the service principal configured for AKS
+CLIENT_ID=$(az aks show --resource-group $AKS_RESOURCE_GROUP --name $AKS_CLUSTER_NAME --query "servicePrincipalProfile.clientId" --output tsv)
+# Get the ACR registry resource id
+ACR_ID=$(az acr show --name $ACR_NAME --resource-group $ACR_RESOURCE_GROUP --query "id" --output tsv)
+# Create role assignment
+az role assignment create --assignee $CLIENT_ID --role acrpull --scope $ACR_ID
