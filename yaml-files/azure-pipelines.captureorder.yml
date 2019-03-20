@@ -1,0 +1,19 @@
+pool:
+  vmImage: 'Ubuntu 16.04'
+
+variables:
+- name: imageName
+  value: 'captureorder:$(Build.BuildId)'
+- group: acr-variables
+  # define three more variables acrName, dockerId and dockerPassword in the build pipeline in UI
+  # these are defined in acr-variables
+
+steps:
+- script: docker build -f Dockerfile -t $(acrName).azurecr.io/$(imageName) .
+  displayName: 'docker build'
+
+- script: docker login -u $(dockerId) -p $(dockerPassword) $(acrName).azurecr.io
+  displayName: 'docker login'
+
+- script: docker push $(acrName).azurecr.io/$(imageName)
+  displayName: 'docker push'
